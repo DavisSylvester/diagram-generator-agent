@@ -16,7 +16,8 @@ import { ParallelExecutor } from '../graph/parallel-executor.mts';
 import { ConsoleChannel } from '../notifications/console-channel.mts';
 import { TelegramChannel } from '../notifications/telegram-channel.mts';
 import { Notifier } from '../notifications/notifier.mts';
-import { PROVIDER_MODEL_MAP } from '../config/models.mts';
+import { PROVIDER_MODEL_MAP, getFallbackTiers } from '../config/models.mts';
+import type { LlmProvider, AgentRole } from '../config/models.mts';
 
 export interface Container {
   readonly logger: Logger;
@@ -67,28 +68,65 @@ export function createContainer(env: EnvConfig, overrides?: Partial<PipelineConf
     ],
   });
 
-  // ── LLM Factory ────────────────────────────────────────────────
-  let primaryFactory: ILlmFactory;
+  // ── LLM Factories (one per provider for cross-provider fallback) ─
+  const factories = new Map<LlmProvider, ILlmFactory>();
 
-  switch (env.LLM_PROVIDER) {
+  // Always create the primary factory
+  const provider: LlmProvider = env.LLM_PROVIDER as LlmProvider;
+
+  switch (provider) {
     case `ollama`:
-      primaryFactory = new OllamaFactory(env.OLLAMA_HOST, env.OLLAMA_API_KEY, env.LLM_TIMEOUT_MS);
+      factories.set(`ollama`, new OllamaFactory(env.OLLAMA_HOST, env.OLLAMA_API_KEY, env.LLM_TIMEOUT_MS));
       break;
     case `openai`:
-      primaryFactory = new OpenAIFactory(env.OPENAI_API_KEY!, env.LLM_TIMEOUT_MS);
+      factories.set(`openai`, new OpenAIFactory(env.OPENAI_API_KEY!, env.LLM_TIMEOUT_MS));
       break;
     case `anthropic`:
-      primaryFactory = new AnthropicFactory(env.ANTHROPIC_API_KEY!, env.LLM_TIMEOUT_MS);
+      factories.set(`anthropic`, new AnthropicFactory(env.ANTHROPIC_API_KEY!, env.LLM_TIMEOUT_MS));
       break;
   }
 
-  const provider = env.LLM_PROVIDER;
-  const models = PROVIDER_MODEL_MAP[provider]!;
+  // Create optional fallback factories if their API keys are available
+  if (provider !== `openai` && env.OPENAI_API_KEY) {
+    factories.set(`openai`, new OpenAIFactory(env.OPENAI_API_KEY, env.LLM_TIMEOUT_MS));
+    logger.info(`Fallback factory registered: openai`);
+  }
+  if (provider !== `anthropic` && env.ANTHROPIC_API_KEY) {
+    factories.set(`anthropic`, new AnthropicFactory(env.ANTHROPIC_API_KEY, env.LLM_TIMEOUT_MS));
+    logger.info(`Fallback factory registered: anthropic`);
+  }
+  if (provider !== `ollama` && env.OLLAMA_HOST) {
+    factories.set(`ollama`, new OllamaFactory(env.OLLAMA_HOST, env.OLLAMA_API_KEY, env.LLM_TIMEOUT_MS));
+    logger.info(`Fallback factory registered: ollama`);
+  }
+
+  const primaryFactory = factories.get(provider)!;
+  const models = PROVIDER_MODEL_MAP[provider];
 
   // ── Agents ─────────────────────────────────────────────────────
-  const buildChain = (role: keyof typeof models) => {
-    const config = models[role];
-    return [{ model: primaryFactory.create(config.model, config.temperature), name: config.model }];
+  // Build a model chain: primary provider model first, then cross-provider
+  // fallback models. Each entry uses the correct factory for its provider
+  // so model names always match the API they're sent to.
+  const buildChain = (role: AgentRole) => {
+    const primaryConfig = models[role];
+    const chain: { model: ReturnType<ILlmFactory[`create`]>; name: string }[] = [
+      { model: primaryFactory.create(primaryConfig.model, primaryConfig.temperature), name: `${provider}/${primaryConfig.model}` },
+    ];
+
+    // Add cross-provider fallback entries
+    const fallbackTiers = getFallbackTiers(provider);
+    for (const tier of fallbackTiers) {
+      const fallbackFactory = factories.get(tier.provider);
+      if (fallbackFactory) {
+        chain.push({
+          model: fallbackFactory.create(tier.model, tier.temperature),
+          name: `${tier.provider}/${tier.model}`,
+        });
+      }
+    }
+
+    logger.debug(`Model chain for ${role}`, { models: chain.map((c) => c.name) });
+    return chain;
   };
 
   const planningAgent = new PlanningAgent(logger, buildChain(`planning`), env.LLM_TIMEOUT_MS);

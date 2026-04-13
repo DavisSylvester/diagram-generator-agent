@@ -15,10 +15,14 @@ interface ModelPricing {
 }
 
 const PRICING: Record<string, ModelPricing> = {
-  'gpt-5.4': { inputPerMillion: 2.50, outputPerMillion: 10.00 },
+  // OpenAI
+  'gpt-4.1': { inputPerMillion: 2.00, outputPerMillion: 8.00 },
+  'gpt-4.1-mini': { inputPerMillion: 0.40, outputPerMillion: 1.60 },
   'gpt-4o-mini': { inputPerMillion: 0.15, outputPerMillion: 0.60 },
+  // Anthropic
   'claude-sonnet-4-6': { inputPerMillion: 3.00, outputPerMillion: 15.00 },
   'claude-haiku-4-5': { inputPerMillion: 0.80, outputPerMillion: 4.00 },
+  // Ollama — local models are free
 };
 
 export class CostTracker {
@@ -31,7 +35,9 @@ export class CostTracker {
   }
 
   record(model: string, inputTokens: number, outputTokens: number, taskId: string): void {
-    const pricing = PRICING[model];
+    // Model name may be in "provider/model" format from the chain — extract the model name
+    const modelName = model.includes(`/`) ? model.split(`/`).slice(1).join(`/`) : model;
+    const pricing = PRICING[modelName];
     const cost = pricing
       ? (inputTokens / 1_000_000) * pricing.inputPerMillion +
         (outputTokens / 1_000_000) * pricing.outputPerMillion
