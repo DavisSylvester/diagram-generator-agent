@@ -1,0 +1,49 @@
+# Dependencies
+node_modules/
+
+# Build output
+out/
+dist/
+*.tgz
+
+# Coverage
+coverage/
+*.lcov
+
+# Logs
+logs/
+*.log
+report.json
+
+# Environment files — NEVER commit secrets
+.env
+.env.*
+!.env.example
+
+# Caches
+.eslintcache
+.cache/
+*.tsbuildinfo
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Pipeline workspace output
+.workspace/
+
+# LangGraph
+.langgraph_api/
+
+# Bun
+bun.lockb
+
+# Temporary files
+tmp/
+temp/
