@@ -1,5 +1,5 @@
 import { mkdir, readdir, readFile, writeFile, stat } from 'node:fs/promises';
-import { join } from 'node:path';
+import { join, dirname, basename } from 'node:path';
 import type { Logger } from 'winston';
 import type { TaskGraph, TaskState, DiagramFile } from '../types/index.mts';
 
@@ -73,8 +73,7 @@ export class Workspace {
 
   async saveDiagram(runId: string, diagram: DiagramFile): Promise<void> {
     const diagramPath = join(this.baseDir, runId, `output`, diagram.path);
-    const dir = diagramPath.substring(0, diagramPath.lastIndexOf(`/`));
-    await mkdir(dir, { recursive: true });
+    await mkdir(dirname(diagramPath), { recursive: true });
     await writeFile(diagramPath, diagram.content);
     this.logger.info(`Diagram saved`, { path: diagram.path, type: diagram.diagramType });
   }
@@ -89,7 +88,7 @@ export class Workspace {
     await mkdir(iterDir, { recursive: true });
 
     for (const diagram of diagrams) {
-      const fileName = diagram.path.split(`/`).pop() ?? `diagram.txt`;
+      const fileName = basename(diagram.path) || `diagram.txt`;
       await writeFile(join(iterDir, fileName), diagram.content);
     }
   }
