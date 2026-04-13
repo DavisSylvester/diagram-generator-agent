@@ -18,6 +18,7 @@ import { TelegramChannel } from '../notifications/telegram-channel.mts';
 import { Notifier } from '../notifications/notifier.mts';
 import { PROVIDER_MODEL_MAP, getFallbackTiers } from '../config/models.mts';
 import type { LlmProvider, AgentRole } from '../config/models.mts';
+import { SyntaxValidator } from '../verification/syntax-validator.mts';
 
 export interface Container {
   readonly logger: Logger;
@@ -25,6 +26,7 @@ export interface Container {
   readonly planningAgent: PlanningAgent;
   readonly diagramAgent: DiagramAgent;
   readonly validationAgent: ValidationAgent;
+  readonly syntaxValidator: SyntaxValidator;
   readonly costTracker: CostTracker;
   readonly workspace: Workspace;
   readonly executor: ParallelExecutor;
@@ -137,6 +139,7 @@ export function createContainer(env: EnvConfig, overrides?: Partial<PipelineConf
   const costTracker = new CostTracker(logger);
   const workspace = new Workspace(env.WORKSPACE_DIR, logger);
   const executor = new ParallelExecutor(logger);
+  const syntaxValidator = new SyntaxValidator(logger, env.WORKSPACE_DIR);
 
   // ── Notifications ──────────────────────────────────────────────
   const channels = [new ConsoleChannel(logger)];
@@ -165,6 +168,7 @@ export function createContainer(env: EnvConfig, overrides?: Partial<PipelineConf
     planningAgent,
     diagramAgent,
     validationAgent,
+    syntaxValidator,
     costTracker,
     workspace,
     executor,

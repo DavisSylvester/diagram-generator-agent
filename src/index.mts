@@ -108,6 +108,7 @@ async function main(): Promise<void> {
       planningAgent: container.planningAgent,
       diagramAgent: container.diagramAgent,
       validationAgent: container.validationAgent,
+      syntaxValidator: container.syntaxValidator,
       costTracker: container.costTracker,
       workspace: container.workspace,
       executor: container.executor,

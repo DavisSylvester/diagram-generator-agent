@@ -2,6 +2,7 @@ import type { Logger } from 'winston';
 import type { PlanningAgent } from '../agents/planning-agent.mts';
 import type { DiagramAgent } from '../agents/diagram-agent.mts';
 import type { ValidationAgent } from '../agents/validation-agent.mts';
+import type { SyntaxValidator } from '../verification/syntax-validator.mts';
 import type { CostTracker } from '../llm/cost-tracker.mts';
 import type { Workspace } from '../io/workspace.mts';
 import type { ParallelExecutor } from '../graph/parallel-executor.mts';
@@ -14,6 +15,7 @@ interface PipelineDeps {
   readonly planningAgent: PlanningAgent;
   readonly diagramAgent: DiagramAgent;
   readonly validationAgent: ValidationAgent;
+  readonly syntaxValidator: SyntaxValidator;
   readonly costTracker: CostTracker;
   readonly workspace: Workspace;
   readonly executor: ParallelExecutor;
@@ -40,7 +42,7 @@ export async function runPipeline(
   config: PipelineConfig,
   deps: PipelineDeps,
 ): Promise<PipelineResult> {
-  const { logger, planningAgent, diagramAgent, validationAgent, costTracker, workspace, executor, notifier } = deps;
+  const { logger, planningAgent, diagramAgent, validationAgent, syntaxValidator, costTracker, workspace, executor, notifier } = deps;
   const { prdContent, runId, outputFormat } = input;
   const startMs = Date.now();
 
@@ -153,7 +155,7 @@ export async function runPipeline(
           existingDiagrams,
           noValidate: config.noValidate,
         },
-        { diagramAgent, validationAgent, costTracker, workspace, logger },
+        { diagramAgent, validationAgent, syntaxValidator, costTracker, workspace, logger },
       );
 
       diagramsByTask.set(task.id, diagrams);

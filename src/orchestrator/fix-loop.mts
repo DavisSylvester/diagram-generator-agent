@@ -1,6 +1,7 @@
 import type { Logger } from 'winston';
 import type { DiagramAgent, DiagramInput } from '../agents/diagram-agent.mts';
 import type { ValidationAgent, ValidationResult } from '../agents/validation-agent.mts';
+import type { SyntaxValidator } from '../verification/syntax-validator.mts';
 import type { CostTracker } from '../llm/cost-tracker.mts';
 import type { Workspace } from '../io/workspace.mts';
 import type { Task, TaskState, DiagramFile, DiagramFormat } from '../types/index.mts';
@@ -13,11 +14,10 @@ import type { Task, TaskState, DiagramFile, DiagramFormat } from '../types/index
 const GOOD_ENOUGH_AFTER_ITERATION = 2;
 
 /**
- * Maximum number of hard errors that still allow acceptance after the
- * good-enough threshold. At iteration >= GOOD_ENOUGH_AFTER_ITERATION,
- * a diagram with <= this many errors is accepted with a warning.
+ * Maximum number of LLM validation errors that still allow acceptance
+ * after the good-enough threshold. Syntax errors are never forgiven.
  */
-const ACCEPTABLE_ERROR_CEILING = 2;
+const ACCEPTABLE_LLM_ERROR_CEILING = 2;
 
 interface FixLoopOptions {
   readonly runId: string;
@@ -33,6 +33,7 @@ interface FixLoopOptions {
 interface FixLoopDeps {
   readonly diagramAgent: DiagramAgent;
   readonly validationAgent: ValidationAgent;
+  readonly syntaxValidator: SyntaxValidator;
   readonly costTracker: CostTracker;
   readonly workspace: Workspace;
   readonly logger: Logger;
@@ -43,7 +44,7 @@ export async function runFixLoop(
   deps: FixLoopDeps,
 ): Promise<{ state: TaskState; diagrams: DiagramFile[] }> {
   const { runId, task, prdContent, outputFormat, maxIterations, taskCostLimit, noValidate } = options;
-  const { diagramAgent, validationAgent, costTracker, workspace, logger } = deps;
+  const { diagramAgent, validationAgent, syntaxValidator, costTracker, workspace, logger } = deps;
 
   let currentDiagrams: DiagramFile[] = [];
   let lastErrors: string[] = [];
@@ -65,7 +66,6 @@ export async function runFixLoop(
 
     // Circuit breaker: 5 consecutive iterations with no improvement
     if (consecutiveNoImprovement >= 5) {
-      // Even on circuit break, if we have diagrams, save them as best-effort
       if (currentDiagrams.length > 0) {
         logger.warn(`Circuit breaker tripped for task: ${task.name} — saving best-effort diagrams`, { taskId: task.id, iteration });
         return await acceptDiagrams(workspace, runId, task, iteration, currentDiagrams, `completed`);
@@ -76,7 +76,7 @@ export async function runFixLoop(
       };
     }
 
-    // Step 1: Generate / Fix diagram
+    // ── Step 1: Generate / Fix diagram ───────────────────────────
     const diagramInput: DiagramInput = {
       taskName: task.name,
       taskDescription: task.description,
@@ -108,16 +108,60 @@ export async function runFixLoop(
     // Save iteration snapshot
     await workspace.saveIterationSnapshot(runId, task.id, iteration, currentDiagrams);
 
-    // Step 2: Validate (optional)
+    // ── Step 2: Syntax / render validation (always runs) ─────────
+    // This is a hard gate — diagrams must parse/render correctly before
+    // we spend tokens on LLM validation or accept the result.
+    const syntaxErrors: string[] = [];
+
+    for (const diagram of currentDiagrams) {
+      const syntaxResult = await syntaxValidator.validate(diagram);
+
+      if (!syntaxResult.valid) {
+        const errorMessages = syntaxResult.errors.map((e) => {
+          const loc = e.line ? ` (line ${e.line})` : ``;
+          return `[${diagram.diagramType}]${loc} ${e.message}`;
+        });
+        syntaxErrors.push(...errorMessages);
+
+        logger.warn(`Syntax errors in ${diagram.diagramType} [${syntaxResult.method}]`, {
+          taskId: task.id,
+          errors: errorMessages,
+        });
+      } else {
+        logger.info(`Syntax valid: ${diagram.diagramType} [${syntaxResult.method}]`, { taskId: task.id });
+      }
+    }
+
+    if (syntaxErrors.length > 0) {
+      // Syntax errors go straight back to the diagram agent — no LLM validation
+      logger.warn(`Syntax validation failed for task: ${task.name} — resubmitting`, {
+        taskId: task.id,
+        iteration,
+        syntaxErrors: syntaxErrors.length,
+      });
+
+      // Track improvement for circuit breaker
+      const currentErrorSet = new Set(syntaxErrors);
+      const fixedCount = [...lastErrorSet].filter((e) => !currentErrorSet.has(e)).length;
+      if (fixedCount > 0) {
+        consecutiveNoImprovement = 0;
+      } else {
+        consecutiveNoImprovement++;
+      }
+
+      lastErrors = syntaxErrors;
+      lastErrorSet = currentErrorSet;
+      continue;
+    }
+
+    // ── Step 3: LLM validation (optional — only after syntax passes) ─
     if (noValidate) {
-      logger.info(`Validation skipped for task: ${task.name}`);
+      logger.info(`LLM validation skipped for task: ${task.name} (syntax passed)`);
       return await acceptDiagrams(workspace, runId, task, iteration, currentDiagrams, `completed`);
     }
 
-    // Collect validation results across all diagrams in this task
-    const allErrors: string[] = [];
-    const allWarnings: string[] = [];
-    let validationRan = false;
+    const llmErrors: string[] = [];
+    const llmWarnings: string[] = [];
 
     for (const diagram of currentDiagrams) {
       const validationResult = await validationAgent.run({
@@ -126,8 +170,6 @@ export async function runFixLoop(
       });
 
       if (!validationResult.ok) {
-        // Validation agent itself failed — fail-open with a warning.
-        // Don't block the diagram because the validator crashed.
         logger.warn(`Validation agent failed for ${diagram.diagramType} — accepting diagram (fail-open)`, {
           taskId: task.id,
           error: validationResult.error.message,
@@ -135,7 +177,6 @@ export async function runFixLoop(
         continue;
       }
 
-      validationRan = true;
       costTracker.record(
         validationResult.value.model,
         validationResult.value.tokenUsage.inputTokens,
@@ -145,57 +186,51 @@ export async function runFixLoop(
 
       const vr: ValidationResult = validationResult.value.result;
 
-      // Only errors block acceptance — warnings and suggestions are logged but don't fail
       if (!vr.valid && vr.errors.length > 0) {
-        allErrors.push(...vr.errors);
+        llmErrors.push(...vr.errors);
       }
       if (vr.warnings.length > 0) {
-        allWarnings.push(...vr.warnings);
+        llmWarnings.push(...vr.warnings);
       }
     }
 
-    // Log warnings (informational, never blocking)
-    if (allWarnings.length > 0) {
-      logger.info(`Validation warnings for task: ${task.name}`, { warnings: allWarnings.length, items: allWarnings });
+    if (llmWarnings.length > 0) {
+      logger.info(`LLM validation warnings for task: ${task.name}`, { warnings: llmWarnings.length, items: llmWarnings });
     }
 
     // ── Accept if clean ──────────────────────────────────────────
-    if (allErrors.length === 0) {
+    if (llmErrors.length === 0) {
       logger.info(`Task completed successfully: ${task.name}`, { taskId: task.id, iteration });
       return await acceptDiagrams(workspace, runId, task, iteration, currentDiagrams, `completed`);
     }
 
-    // ── Good-enough threshold ────────────────────────────────────
-    // After N iterations, accept diagrams with minor remaining errors
-    // rather than looping until the circuit breaker trips.
-    if (iteration >= GOOD_ENOUGH_AFTER_ITERATION && allErrors.length <= ACCEPTABLE_ERROR_CEILING) {
+    // ── Good-enough threshold (LLM errors only — syntax already passed) ─
+    if (iteration >= GOOD_ENOUGH_AFTER_ITERATION && llmErrors.length <= ACCEPTABLE_LLM_ERROR_CEILING) {
       logger.info(
-        `Task accepted (good enough after ${iteration + 1} iterations): ${task.name}`,
-        { taskId: task.id, iteration, remainingErrors: allErrors.length, errors: allErrors },
+        `Task accepted (good enough after ${iteration + 1} iterations, syntax clean): ${task.name}`,
+        { taskId: task.id, iteration, remainingLlmErrors: llmErrors.length, errors: llmErrors },
       );
       return await acceptDiagrams(workspace, runId, task, iteration, currentDiagrams, `completed`);
     }
 
     // ── Track improvement (compare error content, not just count) ─
+    const allErrors = llmErrors;
     const currentErrorSet = new Set(allErrors);
     const newErrors = allErrors.filter((e) => !lastErrorSet.has(e));
     const fixedErrors = [...lastErrorSet].filter((e) => !currentErrorSet.has(e));
 
     if (newErrors.length === 0 && fixedErrors.length === 0) {
-      // Exact same errors as last iteration — no progress at all
       consecutiveNoImprovement++;
     } else if (fixedErrors.length > 0) {
-      // Some old errors were fixed — progress even if new ones appeared
       consecutiveNoImprovement = 0;
       logger.info(`Progress: fixed ${fixedErrors.length} errors, ${newErrors.length} new`, { taskId: task.id });
     } else {
-      // Only new errors (different from last time) — partial progress
       consecutiveNoImprovement++;
     }
 
     lastErrors = allErrors;
     lastErrorSet = currentErrorSet;
-    logger.warn(`Validation errors for task: ${task.name}`, { errors: allErrors.length, iteration, items: allErrors });
+    logger.warn(`LLM validation errors for task: ${task.name}`, { errors: allErrors.length, iteration, items: allErrors });
   }
 
   // Max iterations reached — save whatever we have
